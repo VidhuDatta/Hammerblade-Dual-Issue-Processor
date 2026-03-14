@@ -1,0 +1,591 @@
+# HammerBlade Dual-Issue Superscalar — Complete Architectural Modification Plan
+
+## 1. Current Architecture Summary
+
+The Vanilla Core is a **single-issue, in-order, 5-stage pipeline** (IF → ID → EXE/FP_EXE → MEM → WB/FLW_WB) implementing RV32IMF.
+
+**Key existing separation that enables dual-issue cheaply:**
+- INT path: INT RF (2R/1W) → ALU, LSU, IDIV → INT writeback
+- FP path: FP RF (3R/1W) → FPU_FLOAT, FPU_INT, FDIV/FSQRT → FP writeback
+- The `is_fp_op` signal already routes instructions to one path or the other
+- The icache already fetches **4 instructions per block** — we just use 1 today
+
+**Dual-issue goal:** Issue one INT-class instruction and one FP-class instruction per cycle.
+
+---
+
+## 2. Instruction Classification for Pairing
+
+| Category | Instructions | Issue Slot | RF Read | RF Write |
+|----------|-------------|------------|---------|----------|
+| **Pure INT** | ADD, SUB, LW, SW, branches, JAL, JALR, LUI, AUIPC, CSR, etc. | INT | INT RF rs1, rs2 | INT RF rd |
+| **Pure FP compute** | FADD, FSUB, FMUL, FMA, FMIN, FMAX, FSGNJ, etc. | FP | FP RF rs1, rs2, rs3 | FP RF rd |
+| **FLW (float load)** | FLW | **INT** (address from INT RF) | INT RF rs1 | **FP RF rd** ⚠️ |
+| **FSW (float store)** | FSW | **INT** (address from INT RF) | INT RF rs1, FP RF rs2 | None |
+| **FP→INT** | FCVT.W.S, FMV.X.W, FCMP | FP | FP RF rs1 | INT RF rd |
+| **INT→FP** | FCVT.S.W, FMV.W.X | FP | INT RF rs1 | FP RF rd |
+
+### Legal Pairs (can co-issue)
+| Slot A (INT) | Slot B (FP) | Notes |
+|:---:|:---:|---|
+| Pure INT op | Pure FP compute | Ideal case — no conflicts |
+| FLW | FP compute | ⚠️ Both write FP RF → need 2nd write port |
+| FSW | FP compute | FSW reads FP RF rs2 (already has read port) |
+| Pure INT op | FP→INT (e.g., FCVT.W.S) | Both write INT RF → stall or 2nd INT write port |
+
+### Illegal Pairs (must NOT co-issue)
+- Two FP ops (structural hazard on FP functional units)
+- Two INT ops (structural hazard on ALU/LSU)
+- Anything after a branch/jump (target unknown)
+- RAW/WAW/WAR hazards between the pair on FP registers (when FLW involved)
+- IMUL in INT slot + FP compute in FP slot (IMUL uses FMA hardware!)
+
+---
+
+## 3. Stage-by-Stage Architectural Changes
+
+### 3.1 IF Stage — Instruction Fetch (icache.sv)
+
+**Current:** Icache outputs 1 instruction per cycle via `instr_o`, indexed by `pc_r[0 +: block_offset_width]` into the 4-instruction block.
+
+**Changes needed:**
+
+```
+BEFORE:                          AFTER:
+┌──────────┐                     ┌──────────┐
+│  ICACHE   │──instr_o──►        │  ICACHE   │──instr_o[0]──► (PC)
+│ 4x32 blk  │                    │ 4x32 blk  │──instr_o[1]──► (PC+4)
+└──────────┘                     │           │──second_valid──►
+                                 └──────────┘
+```
+
+**Specific modifications to `icache.sv`:**
+
+1. **Add second instruction output** — read `instr[pc_offset]` AND `instr[pc_offset+1]` from the same block:
+   ```systemverilog
+   // Current (single output):
+   assign instr_out = icache_data_lo.instr[pc_r[0+:icache_block_offset_width_lp]];
+   
+   // New (dual output):
+   wire [icache_block_offset_width_lp-1:0] pc_offset = pc_r[0+:icache_block_offset_width_lp];
+   assign instr_out     = icache_data_lo.instr[pc_offset];      // Slot 0
+   assign instr_out_b   = icache_data_lo.instr[pc_offset + 1];  // Slot 1
+   ```
+
+2. **Block boundary check** — cannot pair if PC is at the last word of a 4-instruction block:
+   ```systemverilog
+   wire at_block_end = &pc_offset;  // pc_offset == 3 for block_size=4
+   assign second_instr_valid_o = ~at_block_end;
+   ```
+
+3. **Second instruction's branch metadata** — also output `lower_sign` and `lower_cout` for the second instruction so decode can work:
+   ```systemverilog
+   wire lower_sign_out_b = icache_data_lo.lower_sign[pc_offset + 1];
+   wire lower_cout_out_b = icache_data_lo.lower_cout[pc_offset + 1];
+   ```
+
+4. **PC advancement** — when dual-issuing, advance PC by 2 instead of 1:
+   ```systemverilog
+   // In vanilla_core.sv pc_n logic:
+   // If dual_issue_this_cycle: pc_n = pc_r + 2
+   // If single_issue:          pc_n = pc_r + 1
+   ```
+
+5. **Energy-saving logic update** — the existing `read_pc_plus4_i` hint for energy saving needs to account for PC+8 (dual-issue advancing by 2 words):
+   ```systemverilog
+   // Existing: suppress icache read if next fetch is PC+4 within same block
+   // New: also suppress if next is PC+8 and both are within same block
+   ```
+
+**New ports for `icache.sv`:**
+```systemverilog
+output [RV32_instr_width_gp-1:0] instr_b_o,           // Second instruction
+output [pc_width_lp-1:0]         pred_or_jump_addr_b_o, // Second branch target
+output                            second_valid_o,        // Second instr available
+output                            branch_predicted_taken_b_o
+```
+
+---
+
+### 3.2 ID Stage — Decode + Register Read + Pairing Logic
+
+**Current:** One `cl_decode` instance, reads INT RF (2 ports), reads FP RF (3 ports), one scoreboard check each.
+
+**Changes needed:**
+
+```
+BEFORE:                              AFTER:
+                                     ┌─────────┐
+┌─────────┐                          │cl_decode │──decode_a──►
+│cl_decode │──decode──►              │  (inst A)│              ┌──────────┐
+│          │                          └─────────┘              │ PAIRING  │──dual_issue
+└─────────┘                          ┌─────────┐              │  LOGIC   │──slot_a_type
+                                     │cl_decode │──decode_b──► └──────────┘──slot_b_type
+                                     │  (inst B)│
+                                     └─────────┘
+```
+
+**3.2.1 Second Decoder Instance (trivial — `cl_decode` is pure combinational):**
+```systemverilog
+// In vanilla_core.sv, add:
+decode_s   decode_b;
+fp_decode_s fp_decode_b;
+
+cl_decode decode1 (
+  .instruction_i(instruction_b),  // Second instruction from icache
+  .decode_o(decode_b),
+  .fp_decode_o(fp_decode_b)
+);
+```
+
+**3.2.2 Pairing Logic (NEW module or combinational block in `vanilla_core.sv`):**
+
+This is the brain of dual-issue. It examines both decoded instructions and decides:
+- Can they co-issue? (`dual_issue_valid`)
+- Which goes to INT slot, which to FP slot? (may need to swap order)
+
+```systemverilog
+// Pairing decision logic
+logic can_dual_issue;
+logic inst_a_is_int, inst_a_is_fp;
+logic inst_b_is_int, inst_b_is_fp;
+
+// Classification
+assign inst_a_is_fp  = id_r.decode.is_fp_op;              // FP compute
+assign inst_a_is_int = ~id_r.decode.is_fp_op;             // INT, FLW, FSW
+assign inst_b_is_fp  = id_r_b.decode.is_fp_op;
+assign inst_b_is_int = ~id_r_b.decode.is_fp_op;
+
+// Must be one INT + one FP (in either order)
+wire one_int_one_fp = (inst_a_is_int & inst_b_is_fp) 
+                    | (inst_a_is_fp & inst_b_is_int);
+
+// Cannot pair if first instruction is a branch/jump (target unknown)
+wire first_is_control = id_r.decode.is_branch_op 
+                      | id_r.decode.is_jal_op 
+                      | id_r.decode.is_jalr_op;
+
+// Cannot pair if IMUL (shares FMA hardware with FP)
+wire has_imul = id_r.decode.is_imul_op | id_r_b.decode.is_imul_op;
+
+// FP RF WAW check: FLW in INT slot writes frd, FP compute also writes frd
+wire flw_fp_waw = (int_slot_decode.write_frd & fp_slot_decode.write_frd)
+                & (int_slot_instr.rd == fp_slot_instr.rd);
+
+// FP RF RAW check: FLW writes frd that FP op reads as frs1/frs2/frs3
+wire flw_fp_raw = int_slot_decode.write_frd & (
+    (fp_slot_decode.read_frs1 & (fp_slot_instr.rs1 == int_slot_instr.rd)) |
+    (fp_slot_decode.read_frs2 & (fp_slot_instr.rs2 == int_slot_instr.rd)) |
+    (fp_slot_decode.read_frs3 & (fp_slot_instr[31:27] == int_slot_instr.rd))
+);
+
+// Combined pair validity
+assign can_dual_issue = one_int_one_fp 
+                      & ~first_is_control 
+                      & ~has_imul
+                      & ~flw_fp_waw 
+                      & ~flw_fp_raw
+                      & second_instr_valid  // From icache (not at block boundary)
+                      & id_r.valid & id_r_b.valid
+                      & ~id_r.icache_miss & ~id_r_b.icache_miss;
+```
+
+**3.2.3 New Pipeline Register (`id_r_b` for second instruction):**
+
+Add to `bsg_vanilla_pkg.sv`:
+```systemverilog
+// Second IF→ID pipeline register (mirrors id_signals_s)
+id_signals_s id_r_b;  // Carries second instruction through ID
+```
+
+**3.2.4 Register File Reads — No extra INT RF ports needed!**
+
+The key insight: when we dual-issue (INT + FP), the INT instruction reads from INT RF and the FP instruction reads from FP RF. They don't compete for the same ports. The existing 2R ports on INT RF and 3R ports on FP RF are sufficient.
+
+Exception: FSW reads FP RF rs2 for store data AND FP compute reads FP RF rs1/rs2/rs3. The FP RF already has 3 read ports, so FSW's rs2 read can share one of those ports. BUT: we need to be careful — if FSW and FP compute happen simultaneously, FSW uses the `instruction.rs2` address on the FP RF while FP compute uses `instruction_b.rs1/rs2/rs3`. This requires **multiplexing the FP RF read addresses** or reading the FSW data from the INT slot's pipeline.
+
+Actually, looking at the existing code: FSW's data (`frs2`) is already routed through the `rs2_bypass_mux` in the INT path, fed by `float_rf_rdata` port. The FP RF already has 3 read ports. If we need FSW data AND 3 FP operands simultaneously, we'd need a **4th read port on FP RF** (or stall). For the first implementation, stalling on FSW+FP pairs is acceptable.
+
+---
+
+### 3.3 EXE / FP_EXE Stage — Execute (Parallel)
+
+**Current:** INT instructions go to EXE (ALU, LSU, address calc). FP instructions go to FP_EXE (FPU_FLOAT, FPU_INT, FDIV/FSQRT). These already run in **parallel** — only one is active per cycle.
+
+**Change:** Both are active simultaneously when dual-issuing.
+
+```
+BEFORE:                                  AFTER:
+                                         
+ ID ──► EXE (if INT)                      ID ──► EXE  (INT slot) ──active──►
+    └──► FP_EXE (if FP)                      └──► FP_EXE (FP slot) ──active──►
+     (only one active)                        (BOTH active when dual-issue)
+```
+
+**Specific changes:**
+
+1. **`exe_n` / `fp_exe_ctrl_n` both get populated when dual-issuing:**
+   ```systemverilog
+   // Current: if is_fp_op, exe_n gets a mostly-empty record
+   // New: when dual-issuing, exe_n gets the INT instruction, fp_exe_ctrl_n gets the FP one
+   // When single-issuing, behavior is unchanged from baseline
+   ```
+
+2. **ALU (`alu.sv`)** — No changes. Only INT slot uses it.
+
+3. **LSU (`lsu.sv`)** — No changes. Only INT slot generates load/store requests. FLW and FSW are INT-slot instructions.
+
+4. **FPU_FLOAT (`fpu_float.sv`)** — No changes. Only FP slot uses it.
+
+5. **FPU_INT (`fpu_int.sv`)** — No changes. Only FP slot uses it.
+
+6. **IDIV (`idiv.sv`)** — No changes. Only INT slot uses it. Must NOT pair with FP (stall_idiv_busy already exists).
+
+7. **Bypass/Forwarding Muxes** — Need additional forwarding paths for cross-slot hazards:
+   ```
+   NEW forwarding paths needed:
+   - FLW result (from MEM/WB) → FP slot's operand (if FP op reads register that FLW wrote)
+   - This is already partially handled by the existing FP bypass muxes
+     (frs1_bypass_mux checks flw_wb_ctrl_r), but timing changes with dual-issue
+   ```
+
+---
+
+### 3.4 MEM Stage — Memory Access
+
+**Current:** Handles DMEM read/write for loads and stores. Only one memory operation per cycle.
+
+**Change:** Minimal. Only the INT slot generates memory operations (loads and stores), so there's no structural hazard on DMEM. The FP result just passes through.
+
+However, we need to **track that dual-issue happened** so the WB stage knows to write both INT RF and FP RF:
+
+```systemverilog
+// Extended mem_ctrl_signals_s
+typedef struct packed {
+    // ... existing fields ...
+    logic dual_issued;        // NEW: this cycle had dual-issue
+    logic [4:0] fp_rd_addr;   // NEW: FP slot's destination register (for FP writeback tracking)
+} mem_ctrl_signals_s;
+```
+
+---
+
+### 3.5 WB / FLW_WB Stage — Write-Back ⚠️ CRITICAL CHANGES
+
+This is where the **main resource conflict** lives. Currently, the FP RF has only **1 write port**, and multiple sources already compete for it:
+
+```
+CURRENT FP RF write sources (priority-arbitrated, 1 per cycle):
+1. Remote FLW response (forced, highest priority)
+2. Local FLW writeback (from flw_wb_r)
+3. FPU_FLOAT result (FADD, FMUL, FMA, etc.)
+4. FDIV/FSQRT result
+5. Non-forced remote FLW response
+```
+
+**With dual-issue, we can have:**
+- FLW (INT slot) producing an FP RF write at FLW_WB stage
+- FP compute (FP slot) producing an FP RF write at FPU2 output
+- **BOTH in the same cycle** → need 2nd write port
+
+#### Solution: Add Second Write Port to FP Register File
+
+```
+BEFORE:                              AFTER:
+┌────────────┐                       ┌────────────┐
+│   FP RF    │                       │   FP RF    │
+│ 3R / 1W    │◄── fp_wb arb         │ 3R / 2W    │◄── Write Port A (FLW / remote)
+│ 33b x 32   │                       │ 33b x 32   │◄── Write Port B (FPU result)
+└────────────┘                       └────────────┘
+```
+
+**Changes to `regfile.sv`:**
+
+The current `regfile` module supports parameterized read ports but has a single write port hardcoded. You need to either:
+
+**(Option A) Modify `regfile.sv` to support 2 write ports:**
+```systemverilog
+module regfile #(
+    parameter width_p = 32
+    , els_p = 32
+    , num_rs_p = 2
+    , num_ws_p = 1       // NEW: parameterized write ports (default 1)
+    , x0_tied_to_zero_p = 1
+) (
+    // ... existing ports ...
+    , input [num_ws_p-1:0] w_v_i
+    , input [num_ws_p-1:0][$clog2(els_p)-1:0] w_addr_i
+    , input [num_ws_p-1:0][width_p-1:0] w_data_i
+);
+```
+
+**(Option B) Use BaseJump STL's multi-ported register file:**
+Check `bsg_mem_2rw_sync` or the multibanked RF modules in BaseJump STL. The project spec recommends leveraging BaseJump STL building blocks.
+
+**FP Writeback Arbitration Rework:**
+
+```systemverilog
+// BEFORE: Single priority mux selecting one writer
+// AFTER: Two independent write ports with separate arbitration
+
+// Write Port A: FLW path (local FLW writeback + remote FLW)
+always_comb begin
+    if (float_remote_load_resp_force_i) begin
+        float_rf_wen_a  = 1'b1;
+        float_rf_waddr_a = float_remote_load_resp_rd_i;
+        float_rf_wdata_a = flw_recoded_data;
+    end else if (flw_wb_ctrl_r.valid) begin
+        float_rf_wen_a  = 1'b1;
+        float_rf_waddr_a = flw_wb_ctrl_r.rd_addr;
+        float_rf_wdata_a = flw_recoded_data;
+    end else begin
+        float_rf_wen_a  = 1'b0;
+    end
+end
+
+// Write Port B: FP compute path (FPU_FLOAT + FDIV/FSQRT + FPU_INT)
+always_comb begin
+    if (fpu_float_v_lo) begin
+        float_rf_wen_b  = 1'b1;
+        float_rf_waddr_b = fpu_float_rd_lo;
+        float_rf_wdata_b = fpu_float_result_lo;
+    end else if (fdiv_fsqrt_v_lo) begin
+        float_rf_wen_b  = 1'b1;
+        float_rf_waddr_b = fdiv_fsqrt_rd_lo;
+        float_rf_wdata_b = fdiv_fsqrt_result_lo;
+    end else begin
+        float_rf_wen_b  = 1'b0;
+    end
+end
+```
+
+**WAW on same register:** If both ports try to write the same FP register, stall or pick one with priority. This should be prevented by the pairing logic, but add a safety check:
+```systemverilog
+wire fp_waw_conflict = float_rf_wen_a & float_rf_wen_b 
+                     & (float_rf_waddr_a == float_rf_waddr_b);
+// If this happens, either stall or let Port A win (FLW has priority)
+```
+
+---
+
+### 3.6 Scoreboard Changes (`scoreboard.sv`)
+
+**Current:**
+- INT scoreboard: 2 source ports, 1 clear port, tracks long-latency INT ops
+- FP scoreboard: 3 source ports, 1 clear port, tracks long-latency FP ops
+
+**Changes needed:**
+
+1. **FP scoreboard needs to check the second instruction's registers too:**
+   When dual-issuing, the FP instruction's source registers (frs1, frs2, frs3) need to be checked against the scoreboard. Currently this is done, but only for the single instruction in ID. With dual-issue, we need to check the *second* instruction's registers against the scoreboard.
+
+   Best approach: **Add source ports** to the FP scoreboard (increase `num_src_port_p` from 3 to 6 to check both instructions' FP register sources). Or, more simply, add separate comparator logic outside the scoreboard module.
+
+2. **Cross-slot scoring:** When FLW issues in the INT slot, it writes an FP register. If this is a remote load, it gets scored in the FP scoreboard. The existing scoring logic handles this (FLW already scores via `float_sb_score`), but we need to also check that the *simultaneously-issuing* FP instruction doesn't read that same register — this is handled by the pairing logic's RAW check.
+
+3. **Add a second clear port** if both an FLW and an FP compute complete writeback simultaneously (increase `num_clear_port_p` from 1 to 2 on FP scoreboard).
+
+---
+
+## 4. New Pipeline Register Definitions (bsg_vanilla_pkg.sv)
+
+```systemverilog
+// Implemented baseline:
+// - Keep id_signals_s as-is and use a second ID register instance in core
+//   for the paired instruction path.
+// - Keep fp_exe_ctrl_r/fp_exe_data_r as the FP slot tracking path.
+// - Do not add optional package-level pairing structs.
+```
+
+---
+
+## 5. Control Logic Changes (vanilla_core.sv)
+
+### 5.1 PC Advancement
+```systemverilog
+// BEFORE:
+wire [pc_width_lp-1:0] pc_plus4 = pc_r + 1'b1;
+
+// AFTER:
+wire [pc_width_lp-1:0] pc_plus4 = pc_r + 1'b1;
+wire [pc_width_lp-1:0] pc_plus8 = pc_r + 2'd2;  // For dual-issue
+
+// In pc_n logic, add:
+// else if (dual_issue_this_cycle & ~branch & ~stall)
+//   pc_n = pc_plus8
+```
+
+### 5.2 Stall Logic Extensions
+
+```systemverilog
+// NEW stall conditions for dual-issue:
+
+// Stall if second instruction has a dependency (but first doesn't)
+// → Issue first alone, hold second for next cycle
+logic stall_second_slot;
+
+// Stall if FP RF write port conflict at WB stage
+logic stall_fp_wb_conflict;
+
+// For simplicity (recommended for first implementation):
+// If EITHER instruction would stall, stall BOTH.
+// This is simpler and still gives significant speedup.
+wire stall_id_dual = stall_id | stall_second_slot;
+```
+
+### 5.3 Flush Handling
+```systemverilog
+// When flushing (branch mispredict, interrupt, mret):
+// Must flush BOTH pipeline slots
+// If dual-issued pair includes a branch that mispredicts,
+// the paired FP instruction must also be killed
+
+// The existing flush signal already kills everything in IF and ID.
+// For dual-issue, also ensure the FP_EXE register is flushed
+// when the paired INT instruction causes a flush.
+```
+
+### 5.4 Interrupt Handling
+```systemverilog
+// Interrupts are checked when an instruction is in EXE.
+// With dual-issue, if an interrupt fires:
+// - Both instructions in EXE/FP_EXE must be killed
+// - NPC must be saved correctly (PC of the INT instruction)
+// - The existing interrupt_ready logic should work, but verify
+//   that npc_r is updated from the correct PC when dual-issuing
+```
+
+### 5.5 NPC (Next PC) Tracking
+```systemverilog
+// npc_r tracks the "next PC to execute after the current instruction"
+// Used for saving to MEPC on interrupts.
+// CRITICAL: With dual-issue, npc_r must account for BOTH instructions.
+// If we dual-issued PC and PC+4, then npc_r should be PC+8.
+// If we single-issued PC, npc_r should be PC+4 (unchanged).
+```
+
+---
+
+## 6. FCSR Changes (fcsr.sv)
+
+**Minor change:** If both slots produce FP exceptions simultaneously (FLW can't, but FP compute can), the FCSR must OR both exception flag sets. In practice, only the FP slot generates `fflags`, so this is unchanged unless you add exception detection to FLW.
+
+---
+
+## 7. Block Diagram — Modified Architecture
+
+```
+                            ┌──────────────────────────────────────────────────────┐
+                            │                    INT DATAPATH                       │
+                            │  ┌────────┐  ┌─────┐  ┌────────┐  ┌────────┐       │
+            ┌──────────┐    │  │ rs1_byp│  │     │  │        │  │        │       │
+┌─────┐     │          │    │  │  mux   ├─►│ LSU ├─►│  DMEM  │  │        │       │
+│     │     │ INT RF   │rs1►│  ├────────┤  └─────┘  └────────┘  │ mem_r  │  wb_r │
+│     │     │ 32x32    │    │  │ rs2_byp│  ┌─────┐              │        ├──┐    │
+│  I  │     │ 2R / 1W  │rs2►│  │  mux   ├─►│ ALU │──────────────►        │  │    │
+│  C  │instr│          │    │  └────────┘  └─────┘              └────────┘  │    │
+│  A  ├─A──►├──────────┤    │              ┌──────┐                         │    │
+│  C  │     │ DECODE A │    │              │ IDIV │─────────────────────────►│    │
+│  H  │     ├──────────┤    └──────────────┴──────┴─────────────────────────┘    │
+│  E  │     │          │                                                    ▼    │
+│     │instr│ PAIRING  │    ┌──────────────────────────────────────────────────────┐
+│  4  ├─B──►│  LOGIC   │    │                    FP DATAPATH                       │
+│  x  │     │          │    │  ┌────────┐  ┌─────────┐  ┌──────┐  ┌──────┐       │
+│  32 │     ├──────────┤    │  │frs1_byp│  │FPU_FLOAT│  │ fpu1 │  │ fpu2 │       │
+│     │     │          │    │  │  mux   ├─►│  (FMA)  ├─►│  _r  ├─►│  _r  │       │
+│ blk │     │ FP RF    │rs1►│  ├────────┤  ├─────────┤  └──────┘  └──┬───┘       │
+└─────┘     │ 33x32    │    │  │frs2_byp│  │FPU_INT  │               │           │
+            │ 3R / 2W  │rs2►│  │  mux   │  │(cmp/cvt)│               │           │
+            │  ▲    ▲  │    │  ├────────┤  ├─────────┤               │           │
+            │  │    │  │rs3►│  │frs3_byp│  │  FDIV   │               │           │
+            │  WrA  WrB│    │  │  mux   │  │ FSQRT   │───────────────►           │
+            └──┼────┼──┘    │  └────────┘  └─────────┘               │           │
+               │    │       └─────────────────────────────────────────┼───────────┘
+               │    │                                                 │
+               │    └── FP compute writeback (FPU_FLOAT/FDIV result) ─┘
+               │
+               └── FLW writeback (from DMEM through INTtoRecFN converter)
+```
+
+### Key Visual Changes from Baseline:
+1. **ICACHE** now outputs **two instructions** (instr_A and instr_B)
+2. **Two DECODE** instances (DECODE A and DECODE B) feeding into **PAIRING LOGIC**
+3. **FP RF** now has **2 write ports** (Write Port A for FLW path, Write Port B for FP compute path)
+4. **Both datapaths** can be **active simultaneously** (not mutually exclusive)
+5. **PC+4 adder** supplemented with **PC+8** for dual-issue advancement
+
+---
+
+## 8. File-by-File Modification Summary
+
+| File | Effort | Changes |
+|------|--------|---------|
+| **vanilla_core.sv** | 🔴 MAJOR | Pairing logic, dual PC advancement, dual pipeline register management, extended stall/flush logic, FP RF 2-write-port control, NPC tracking for dual-issue |
+| **icache.sv** | 🟡 MODERATE | Second instruction output, second branch target computation, block boundary detection, second_valid signal |
+| **bsg_vanilla_pkg.sv** | 🟡 MODERATE | Reuse existing structs; no optional package-level pairing structs required |
+| **regfile.sv** | 🟡 MODERATE | Add 2nd write port parameter (or use BaseJump STL multi-port RF) |
+| **scoreboard.sv** | 🟡 MODERATE | Additional source ports for 2nd instruction check, 2nd clear port on FP scoreboard |
+| **cl_decode.sv** | 🟢 MINOR | No internal changes — just instantiate a 2nd copy |
+| **bsg_vanilla_defines.svh** | 🟢 MINOR | No changes needed (icache format already supports block access) |
+| **fcsr.sv** | 🟢 MINOR | Possibly OR two fflags sources if both produce exceptions |
+| **alu.sv** | ⚪ NONE | Only INT slot uses it |
+| **lsu.sv** | ⚪ NONE | Only INT slot generates memory ops |
+| **fpu_float.sv** | ⚪ NONE | Only FP slot uses it |
+| **fpu_int.sv** | ⚪ NONE | Only FP slot uses it |
+| **fpu_fdiv_fsqrt.sv** | ⚪ NONE | Only FP slot uses it |
+| **idiv.sv** | ⚪ NONE | Only INT slot uses it |
+| **load_packer.sv** | ⚪ NONE | Only INT path load uses it |
+| **mcsr.sv** | 🟢 MINOR | Verify interrupt/NPC logic with dual-issue PC advancement |
+| **network_rx.sv** | ⚪ NONE | External network interface unchanged |
+| **network_tx.sv** | ⚪ NONE | External network interface unchanged |
+
+---
+
+## 9. Implementation Priority / Phasing
+
+### Phase 1: Pure INT+FP Pairing (No FLW special case)
+1. Modify icache to output 2 instructions
+2. Add 2nd decoder instance
+3. Add pairing logic (INT + FP compute only, no FLW pairing)
+4. Populate both EXE and FP_EXE when dual-issuing
+5. Extend PC advancement to +2
+6. Extend flush/stall to cover both slots
+7. **Test:** Run hb_hammerbench, compare cycle counts
+
+### Phase 2: FLW + FP Compute Pairing
+1. Add 2nd write port to FP register file
+2. Rework FP writeback arbitration for 2 ports
+3. Add RAW/WAW/WAR checks for FP registers in pairing logic
+4. Update FP scoreboard (additional ports)
+5. **Test:** Run FP-heavy benchmarks, verify correctness
+
+### Phase 3: FSW + FP Compute Pairing (Deferred)
+1. Handle FSW's FP RF read port contention
+2. Parameterize FSW pairing support
+3. **Test:** Additional benchmarks
+
+### Phase 4: Verification & Optimization
+1. Run ALL of hb_hammerbench
+2. Build cycle count comparison table (before vs after)
+3. Profile which benchmarks benefit most
+4. Optimize pairing logic for critical path
+
+---
+
+## 10. Critical Corner Cases to Handle
+
+1. **IMUL + FP compute:** IMUL uses the FMA hardware inside FPU_FLOAT. Cannot dual-issue IMUL with any FP op. The pairing logic must check `is_imul_op`.
+
+2. **FP→INT ops (FCVT.W.S, FMV.X.W):** These write to INT RF. If paired with an INT op that also writes INT RF, you have a WAW conflict. Stall or add 2nd INT RF write port (probably just stall — rare case).
+
+3. **INT→FP ops (FCVT.S.W, FMV.W.X):** These read from INT RF rs1. If the INT slot instruction also uses INT RF, no conflict (separate read ports). But verify forwarding still works.
+
+4. **Branch in first slot:** Never pair. The second instruction might not be on the correct path.
+
+5. **Icache miss:** If the first instruction misses, don't try to issue the second. The miss handling already inserts a bubble.
+
+6. **Remote load response during dual-issue WB:** The forced remote load response already stalls the pipeline via `stall_remote_flw_wb`. With 2 FP write ports, the remote response can use Port A while FP compute uses Port B — eliminating this stall! This is an additional performance benefit.
+
+7. **CSR instructions:** Never pair CSR ops (they have complex side effects). Already gated by `stall_fcsr` when FP pipeline is draining.
+
+8. **Fence/Barrier:** Never pair — these require pipeline drain.
